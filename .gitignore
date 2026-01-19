@@ -5,3 +5,7 @@ __pycache__/
 venv/
 .env/
 .DS_Store
+
+*/chromedriver.exe
+*/selenium_user_dir
+*/papers
