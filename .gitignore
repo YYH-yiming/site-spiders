@@ -9,4 +9,4 @@ venv/
 */chromedriver.exe
 */selenium_user_dir
 */papers
-/*.csv
+*.csv
