@@ -3,110 +3,218 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains
-import requests
+from selenium.webdriver.common.keys import Keys
 import os
 import time
 import random
-import logging  # <--- 新增
+import logging
+from urllib.parse import urljoin
+import base64 # 必须导入，用于解码浏览器传回的文件流
+import datetime
 
 # ================= 配置区域 =================
-INPUT_CSV = 'doi_output.csv'       
-RESULT_CSV = 'results.csv'   
-PDF_DIR = 'papers'           
-BASE_URL = 'https://sci-hub.st/'
-DEBUG_PORT = "127.0.0.1:9333" 
-LOG_FILE = 'spider_run.log'  # <--- 新增：日志文件名
-# ===========================================
+INPUT_CSV = 'doi_output.csv'       # 输入文件，必须包含 DOI 列
+RESULT_CSV = 'results.csv'         # 结果统计文件
+PDF_DIR = 'papers'                 # PDF 保存目录
+BASE_URL = 'https://sci-hub.st/'   # 初始地址，会自动跳转
+DEBUG_PORT = "127.0.0.1:9333"      # 接管已打开的浏览器
+LOG_FILE = 'spider_run.log'        # 详细运行日志
 
-# --- 初始化日志配置 ---
-# 这样设置后，日志既会显示在屏幕上，也会保存在文件中，且带有时间戳
+now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+os.makedirs("logs", exist_ok=True)
+LOG_FILE = os.path.join("logs", f"spider_run_{now_str}.log")
+
+DOWNLOAD_DIR = "download_info"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+SUCCESS_LOG = os.path.join(DOWNLOAD_DIR, f"download_success_{now_str}.txt")
+FAIL_LOG = os.path.join(DOWNLOAD_DIR, f"download_fail_{now_str}.txt")
+
+# --- 初始化日志 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8', mode='a'), # 写入文件
-        logging.StreamHandler()  # 输出到控制台
+        logging.FileHandler(LOG_FILE, encoding='utf-8', mode='a'),
+        logging.StreamHandler()
     ]
 )
 
+def record_link_log(filepath, doi, url):
+    """记录简易日志，方便后续补录"""
+    try:
+        with open(filepath, 'a', encoding='utf-8') as f:
+            f.write(f"{doi}\t{url}\n")
+    except Exception as e:
+        logging.error(f"写入链接日志失败: {e}")
+
 def clean_filename(doi):
+    """将 DOI 转换为合法的文件名"""
     return doi.replace('/', '_').replace(':', '-') + '.pdf'
 
 def init_driver():
+    """连接到已打开的 Chrome"""
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", DEBUG_PORT)
     driver = webdriver.Chrome(options=options)
+    # 设置脚本执行超时时间 (秒)，防止下载大文件时 Selenium 以为卡死
+    driver.set_script_timeout(180) 
     return driver
 
 def log_result(doi, status, file_path=None, message=""):
-    """
-    记录结构化结果到CSV (用于后续数据分析)
-    """
+    """记录详细结果到 CSV"""
     new_row = pd.DataFrame([{
         'doi': doi,
         'status': status,
         'file_path': file_path,
         'message': message,
-        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S") # CSV里也加一列时间
+        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
     }])
     header = not os.path.exists(RESULT_CSV)
     new_row.to_csv(RESULT_CSV, mode='a', header=header, index=False)
 
-def download_file_via_requests(url, save_path, cookies_dict, user_agent):
-    headers = {'User-Agent': user_agent}
-    try:
-        if url.startswith('//'):
-            url = 'https:' + url
-        elif url.startswith('/'):
-            url = 'https://sci-hub.st' + url
-            
-        r = requests.get(url, headers=headers, cookies=cookies_dict, timeout=60)
-        if r.status_code == 200:
-            with open(save_path, 'wb') as f:
-                f.write(r.content)
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"下载流发生网络错误: {e}")
-        return False
-
-# --- 核心优化：随机等待助手 ---
 def random_sleep(min_s, max_s, reason=""):
-    """在 min_s 到 max_s 之间随机睡眠"""
+    """随机等待"""
     duration = random.uniform(min_s, max_s)
-    # 如果你想看每一次等待的日志，可以取消下面这行的注释，但通常没必要
-    # logging.debug(f"等待 {duration:.2f}s: {reason}") 
     time.sleep(duration)
 
-def human_input(element, text):
-    """模拟人类逐字输入，带打字韵律"""
+def human_input_simulation(element, text):
+    """模拟逐字输入"""
     for char in text:
         element.send_keys(char)
-        time.sleep(random.uniform(0.05, 0.25))
+        time.sleep(random.uniform(0.03, 0.15))
+
+def robust_input(driver, element, text, max_retries=3):
+    """
+    【核心增强】强力输入模式：
+    1. JS 强制聚焦
+    2. 清空
+    3. 输入
+    4. 校验输入框内容是否正确
+    """
+    for i in range(max_retries):
+        try:
+            # 1. 显式滚动到视野中央
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'auto', block: 'center'});", element)
+            time.sleep(1)
+
+            # 2. JS 强制聚焦 (最关键的一步，解决点不准的问题)
+            driver.execute_script("arguments[0].focus();", element)
+            time.sleep(1)
+
+            # 3. 清空旧内容
+            element.clear()
+            
+            # 4. 拟人输入
+            human_input_simulation(element, text)
+            
+            # 5. 校验：获取输入框当前的值
+            current_val = element.get_attribute('value')
+            
+            # 宽松匹配：只要输入框里包含了我们的 DOI 就算成功
+            if current_val and text in current_val:
+                return True
+            else:
+                logging.warning(f"输入校验失败 (第 {i+1} 次)，当前框内值: '{current_val}'")
+                
+        except Exception as e:
+            logging.warning(f"输入操作异常: {e}")
+            
+        time.sleep(1.0) # 失败后冷却
+        
+    logging.error(f"严重错误：尝试 {max_retries} 次后仍无法正确输入 DOI！")
+    record_link_log(FAIL_LOG, text, "None")
+    return False
+
+def download_via_browser_js(driver, url, save_path):
+    """
+    【核心增强】使用浏览器内部 JS 下载，绕过 Python Requests 403 拦截
+    """
+    # 这段 JS 会在浏览器内执行：fetch -> blob -> base64
+    js_script = """
+    var url = arguments[0];
+    var callback = arguments[1];
+    
+    fetch(url)
+        .then(response => {
+            if (response.status !== 200) {
+                callback("HTTP_ERROR_" + response.status);
+                return;
+            }
+            return response.blob();
+        })
+        .then(blob => {
+            var reader = new FileReader();
+            reader.readAsDataURL(blob); 
+            reader.onloadend = function() {
+                callback(reader.result); // 返回 Base64 字符串
+            }
+        })
+        .catch(error => {
+            callback("JS_ERROR_" + error.toString());
+        });
+    """
+    
+    try:
+        logging.info("正在调用浏览器下载引擎...")
+        # execute_async_script 会挂起 Python，直到 JS 调用 callback
+        result = driver.execute_async_script(js_script, url)
+        
+        if result and isinstance(result, str):
+            if result.startswith("HTTP_ERROR"):
+                logging.error(f"浏览器下载失败，服务端状态码: {result}")
+                return False
+            elif result.startswith("JS_ERROR"):
+                logging.error(f"JS 执行错误: {result}")
+                return False
+            elif result.startswith("data:"):
+                # 解析 Base64 (格式: data:application/pdf;base64,JVBERi0xLj...)
+                try:
+                    header, encoded = result.split(",", 1)
+                    file_data = base64.b64decode(encoded)
+                    
+                    with open(save_path, "wb") as f:
+                        f.write(file_data)
+                    
+                    # 验证文件大小
+                    if os.path.getsize(save_path) > 1000:
+                        return True
+                    else:
+                        logging.warning("下载的文件太小 (<1KB)，可能是无效文件")
+                        return False
+                except Exception as decode_err:
+                    logging.error(f"Base64 解码失败: {decode_err}")
+                    return False
+            else:
+                logging.error("未知的数据返回格式")
+                return False
+        return False
+        
+    except Exception as e:
+        logging.error(f"JS 下载过程发生 Python 异常: {e}")
+        return False
 
 def main():
     if not os.path.exists(PDF_DIR):
         os.makedirs(PDF_DIR)
 
-    logging.info(">>> 程序启动，正在连接 Chrome 调试端口...")
+    logging.info(">>> Sci-Hub爬虫程序启动...")
     
     try:
         driver = init_driver()
-        # 简单验证一下是否连接成功
-        current_title = driver.title
-        logging.info(f"Chrome 连接成功，当前页面标题: {current_title}")
+        logging.info("Chrome 连接成功")
     except Exception as e:
-        logging.error(f"Chrome 连接失败，请检查是否已在命令行启动浏览器。错误详情: {e}")
+        logging.error(f"Chrome 连接失败，请检查是否启动了调试模式: {e}")
         return
 
     if not os.path.exists(INPUT_CSV):
         logging.error(f"找不到输入文件: {INPUT_CSV}")
         return
     
-    # 读取输入
+    # 读取 DOI
     try:
         df = pd.read_csv(INPUT_CSV)
         col_name = df.columns[0]
@@ -115,14 +223,15 @@ def main():
         logging.error(f"读取 CSV 失败: {e}")
         return
     
-    # 读取已完成进度
+    # 读取进度（断点续传）
     processed = set()
     if os.path.exists(RESULT_CSV):
         try:
             processed_df = pd.read_csv(RESULT_CSV)
-            processed = set(processed_df['doi'].astype(str).values)
+            if not processed_df.empty:
+                processed = set(processed_df['doi'].astype(str).values)
         except:
-            logging.warning("读取结果文件失败，可能文件为空，将重新开始记录。")
+            pass
     
     todos = [d for d in all_dois if d not in processed]
     logging.info(f"任务统计：总数 {len(all_dois)} | 已完成 {len(processed)} | 待处理 {len(todos)}")
@@ -130,93 +239,104 @@ def main():
     wait = WebDriverWait(driver, 20)
 
     for index, doi in enumerate(todos):
-        # 进度提示
         logging.info(f"[{index+1}/{len(todos)}] 正在处理: {doi}")
         
         try:
             # 1. 打开网页
             driver.get(BASE_URL)
-            random_sleep(1.5, 3.0, "浏览页面") 
+            random_sleep(3, 5) 
             
-            # 2. 寻找输入框
-            input_box = wait.until(EC.element_to_be_clickable((By.NAME, "request")))
-            
-            # 瞄准
-            random_sleep(0.5, 1.5, "瞄准输入框")
-            ActionChains(driver).move_to_element(input_box).click().perform()
-            random_sleep(0.2, 0.8, "准备打字")
-            
-            # 3. 清空并拟人输入
-            input_box.clear()
-            human_input(input_box, doi) 
-            
-            # 检查
-            random_sleep(0.8, 2.0, "检查输入")
-            
-            # 4. 点击 Open 按钮
-            submit_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'open')]")
-            random_sleep(0.3, 1.0, "移动到按钮")
-            driver.execute_script("arguments[0].click();", submit_btn)
-            
-            # 5. 等待结果加载
+            # 2. 寻找输入框 (带重试)
+            input_box = None
             try:
+                input_box = wait.until(EC.element_to_be_clickable((By.NAME, "request")))
+            except TimeoutException:
+                logging.warning("输入框加载超时，刷新重试...")
+                driver.refresh()
+                random_sleep(2.0, 3.0)
+                input_box = wait.until(EC.element_to_be_clickable((By.NAME, "request")))
+
+            # === 使用强力输入函数 ===
+            if not robust_input(driver, input_box, doi):
+                log_result(doi, "Input Failed")
+                logging.error(f"输入失败，跳过: {doi}")
+                continue
+            
+            random_sleep(0.3, 0.8)
+            
+            # 3. 点击 Open 按钮 (兼容多种UI)
+            submit_btns = driver.find_elements(By.XPATH, "//button[contains(text(), 'open')] | //div[@id='buttons']//button")
+            if submit_btns:
+                driver.execute_script("arguments[0].click();", submit_btns[0])
+            else:
+                # 最后的尝试：回车键
+                input_box.send_keys(Keys.ENTER)
+            
+            # 4. 等待结果
+            try:
+                # 等待: 错误提示 OR 下载按钮 OR 嵌入式PDF
                 wait.until(EC.presence_of_element_located(
-                    (By.XPATH, "//*[contains(@class, 'message')] | //*[contains(@class, 'download')]")
+                    (By.XPATH, "//*[contains(@class, 'message')] | //div[contains(@class, 'download')] | //embed[@id='pdf']")
                 ))
-                random_sleep(1.0, 2.0, "查看结果")
-                
+                random_sleep(1.0, 2.0)
             except TimeoutException:
                 if "captcha" in driver.page_source.lower():
-                    logging.warning(f"检测到验证码！DOI: {doi}")
-                    logging.warning(">>> 请切回浏览器手动完成验证，完成后按回车继续...")
-                    input() # 阻塞等待
-                    logging.info("用户表示验证已完成，继续运行...")
+                    logging.warning(">>> !!! 检测到验证码 !!! <<<")
+                    logging.warning("请手动在浏览器完成验证，然后按回车继续...")
+                    input() 
                 else:
-                    logging.warning(f"页面加载超时或结构异常: {doi}")
+                    logging.warning("结果页加载超时")
                     log_result(doi, "Timeout")
                 continue
 
-            # 6. 解析逻辑
-            # 情况 A: 成功找到下载链接
-            if len(driver.find_elements(By.CSS_SELECTOR, ".download a")) > 0:
-                download_link = driver.find_elements(By.CSS_SELECTOR, ".download a")[0]
-                pdf_url = download_link.get_attribute("href")
-                
-                logging.info(f"发现下载链接: {pdf_url[:50]}...")
-                
+            # 5. 解析页面并下载
+            current_page_url = driver.current_url
+            pdf_url = None
+            
+            # 情况 A: 典型的下载按钮页面
+            download_elements = driver.find_elements(By.CSS_SELECTOR, "div.download a")
+            
+            # 情况 B: 直接嵌入的 PDF
+            embed_elements = driver.find_elements(By.ID, "pdf")
+
+            if len(download_elements) > 0:
+                raw_url = download_elements[0].get_attribute("href")
+                pdf_url = urljoin(current_page_url, raw_url)
+                logging.info(f"发现下载链接: {pdf_url}")
+            
+            elif len(embed_elements) > 0:
+                raw_url = embed_elements[0].get_attribute("src")
+                pdf_url = urljoin(current_page_url, raw_url)
+                logging.info(f"发现嵌入式PDF: {pdf_url}")
+            
+            elif "Alas" in driver.page_source or "not found" in driver.page_source.lower():
+                 logging.info(f"Sci-Hub 未收录: {doi}")
+                 log_result(doi, "Not Found")
+                 continue
+            else:
+                logging.error("页面结构无法识别")
+                log_result(doi, "Structure Error")
+                continue
+
+            # 6. 执行 JS 下载
+            if pdf_url:
                 save_path = os.path.join(PDF_DIR, clean_filename(doi))
-                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                ua = driver.execute_script("return navigator.userAgent;")
                 
-                if download_file_via_requests(pdf_url, save_path, cookies, ua):
+                if download_via_browser_js(driver, pdf_url, save_path):
                     logging.info(f"下载成功: {save_path}")
                     log_result(doi, "Success", file_path=save_path)
+                    record_link_log(SUCCESS_LOG, doi, pdf_url)
                 else:
                     logging.error(f"下载失败: {doi}")
                     log_result(doi, "Download Failed")
-            
-            # 情况 B: 网站明确表示未收录
-            elif len(driver.find_elements(By.CSS_SELECTOR, ".message")) > 0:
-                msg_text = driver.find_element(By.CSS_SELECTOR, ".message").text
-                if "Alas" in msg_text:
-                    logging.info(f"Sci-Hub 未收录此文章: {doi}")
-                    log_result(doi, "Not Found")
-                else:
-                    logging.warning(f"未知提示信息: {msg_text[:50]}")
-                    log_result(doi, "Unknown Message", message=msg_text)
-            
-            # 情况 C: 结构无法识别
-            else:
-                logging.error(f"页面结构无法识别: {doi}")
-                log_result(doi, "Structure Error")
+                    record_link_log(FAIL_LOG, doi, pdf_url)
 
         except Exception as e:
-            logging.error(f"处理 {doi} 时发生未捕获异常: {e}")
+            logging.error(f"处理 {doi} 时发生异常: {e}")
             log_result(doi, "Error", message=str(e))
         
-        # 休息
-        logging.info("...随机休息中...")
-        random_sleep(1.9, 4.3, "任务间歇")
+        # 任务间随机休息，避免触发更高等级的风控
+        random_sleep(2.5, 5.0)
 
     logging.info(">>> 所有任务处理完毕。")
 
