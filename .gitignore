@@ -10,3 +10,5 @@ venv/
 */selenium_user_dir
 */papers
 *.csv
+*/download_info
+*/logs
